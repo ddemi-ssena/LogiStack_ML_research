@@ -1,57 +1,118 @@
-# Logistack ML Research
+# LogiStack ML Research
 
-This repository contains the customer segmentation and repeat-purchase/churn experiments for the Logistack project. It reads analytical tables from the project's PostgreSQL Gold/Silver warehouse; it does not include source customer data, database dumps, credentials, or fitted model binaries.
+This repository contains the machine-learning research for **LogiStack**, an end-to-end e-commerce data engineering, streaming, and analytics project. The companion platform repository builds the PostgreSQL medallion warehouse and serves the selected churn model through its API.
 
-## Scope
+- **Platform project:** [Softito_Logistack_Project](https://github.com/ddemi-ssena/Softito_Logistack_Project)
+- **Research in this repository:** customer segmentation and repeat-purchase/churn model experiments
+- **Data source:** [Olist Brazilian E-Commerce Public Dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce), a public historical marketplace dataset covering 2016–2018
 
-- K-Means RFM segmentation with four business-facing customer segments.
-- Single-snapshot Logistic Regression, Random Forest, LightGBM, and XGBoost comparisons.
-- Three-window, 180-day pooled XGBoost churn experiment with customer-grouped validation.
-- SQL feature extraction directly from `gold.fact_orders`, `gold.fact_order_items`, and `silver.order_reviews`.
-- Benchmark summaries and report-ready figures based on the project's local warehouse run.
+The ML code reads the platform's local PostgreSQL Gold and Silver tables. This repository does not contain the source CSVs, customer-level extracts, database dumps, passwords, or trained model binaries.
 
-The upstream data engineering project builds the warehouse. The expected table/column contract is described below and in [`database/01_ml_data_contract.sql`](database/01_ml_data_contract.sql). Apply the upstream project's database migrations/ETL before running any experiment. The SQL file here documents the ML-facing mart contract; it does not replace upstream ETL.
+## Research questions
 
-## Results from the recorded local run
+1. How can customers be grouped by historical purchase behavior using Recency, Frequency, and Monetary (RFM) features?
+2. How well can repeat-purchase behavior over a future 180-day period be estimated from customer history?
+3. How do Logistic Regression, Random Forest, LightGBM, and XGBoost compare, and does pooling temporal snapshots give a more robust evaluation cohort?
 
-The snapshot baselines use a stratified 80/20 split of the 2018-03-04 cohort. Production Sliding Window XGBoost pools three temporal cohorts and uses `GroupShuffleSplit` by `customer_unique_id`. The different split protocols mean this table is a project benchmark summary, not a claim that every model used the same test rows.
+## Dataset and how it is used
 
-| Model | Evaluation data | ROC-AUC | PR-AUC | F1 | Accuracy |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Logistic Regression (balanced) | Single snapshot | 0.7033 | 0.9823 | 0.8179 | 69.80% |
-| Random Forest (balanced) | Single snapshot | 0.6872 | 0.9785 | 0.9752 | 95.16% |
-| LightGBM (balanced) | Single snapshot | 0.6617 | 0.9779 | 0.9613 | 92.59% |
-| **XGBoost (production)** | **Sliding Window** | **0.7398** | **0.9781** | **0.8998** | **82.30%** |
+The source is the Olist Brazilian E-Commerce Public Dataset published on Kaggle. The upstream LogiStack project loads the relevant order, customer, order-item, product, payment, and review CSVs into PostgreSQL Bronze, cleans/standardizes them into Silver, and builds analytical Gold facts and marts. Kafka data in the platform is a replay simulation of historical orders; it is not a separate live dataset used to train these models.
 
-The sliding-window run pooled **3,678 rows** from snapshots **2017-10-01**, **2017-12-15**, and **2018-03-04** (180-day outcome horizon). The group split produced **2,955 training rows** and **723 test rows**, with **0 customer overlap**. Its confusion matrix in `[[TN, FP], [FN, TP]]` order is `[[20, 19], [109, 575]]`.
+For the local warehouse run documented here, the six source tables contained these row counts:
 
-For production XGBoost, feature importances were `frequency` **30.88%**, `recency_days` **22.76%**, `monetary` **17.09%**, `avg_item_price` **15.09%**, and `avg_review_score` **14.18%**. Importances are model-relative and sum to 100% (rounding may apply).
+| Source entity | Bronze rows | Silver rows | Gold input used by ML |
+| --- | ---: | ---: | --- |
+| Orders | 99,441 | 99,092 | `gold.fact_orders` (99,092) |
+| Customers | 99,441 | 99,441 | `gold.dim_customers` (96,096 unique customer dimension rows) |
+| Order items | 112,650 | 112,279 | `gold.fact_order_items` (112,279) |
+| Payments | 103,886 | 103,520 | Not a direct churn/RFM model feature |
+| Reviews | 99,224 | 98,879 | `silver.order_reviews.review_score` |
+| Products | 32,951 | 32,951 | Not a direct churn/RFM model feature |
 
-RFM K-Means was run with **k=4** on **93,106 valid customers**. The observed segment counts were Champions **2,789**, Loyal **16,843**, At Risk **37,260**, and Hibernating **36,214**.
+These are observed counts from one local database snapshot, not guaranteed counts for a newly loaded copy. The analytical Silver order layer covers purchases from 2017-01-01 through 2018-08-31; the raw Bronze layer also contains records outside that range or without an eligible purchase timestamp.
 
-These values document the recorded local database run. Re-running the scripts against a different warehouse snapshot may produce different cohort sizes, splits, and scores. See [`experiments/benchmark_results.md`](experiments/benchmark_results.md) and [`report_figures/`](report_figures/) for the summary and figures.
+### Churn feature and label construction
 
-## Repository layout
+For each snapshot, SQL reads historical orders strictly before the snapshot date and builds:
+
+- `recency_days`: days since the customer's most recent historical order;
+- `frequency`: historical order count;
+- `monetary`: historical sum of product amounts;
+- `avg_item_price`: mean historical order-item price;
+- `avg_review_score`: mean historical review score where available.
+
+The cohort includes customers with at least **two historical orders**. The binary target is `churn=1` when no order is observed in the next **180 days**, and `churn=0` when a future order is observed. Thus, class 1 means no repeat order in the observation window. The data is strongly imbalanced toward class 1 in the observed cohorts; interpret Accuracy, F1, PR-AUC, and confusion matrices with that label definition in mind.
+
+The single-snapshot baseline uses the 2018-03-04 snapshot. The production experiment pools three 180-day windows: **2017-10-01**, **2017-12-15**, and **2018-03-04**. This gives the model examples from multiple points in the historical period while retaining a fully observed future label window.
+
+### RFM segmentation data
+
+The segmentation workflow reads `customer_unique_id`, `recency_days`, `frequency`, and `monetary` from `gold.mart_customer_rfm`. For the recorded run it used **93,106 valid customer rows**, log-transformed the three numeric features with `log1p`, standardized them, and fit K-Means with **k=4**, `n_init=10`, and `random_state=42`. The resulting counts were:
+
+| Segment | Customers |
+| --- | ---: |
+| Champions | 2,789 |
+| Loyal | 16,843 |
+| At Risk | 37,260 |
+| Hibernating | 36,214 |
+
+Business labels are assigned from the resulting cluster RFM profiles; K-Means cluster IDs themselves have no fixed business meaning.
+
+## Model comparison
+
+The following values are from the recorded local database run. Logistic Regression, Random Forest, and LightGBM use the same single-snapshot cohort with a stratified 80/20 split (1,402 train / 351 test). Sliding Window XGBoost uses a different, pooled temporal cohort and a group split, so its test set is not identical to the baselines. The table is a transparent project comparison across the experiments, not a controlled same-test-set leaderboard.
+
+| Model | Evaluation protocol | Precision | Recall | F1 | Accuracy | ROC-AUC | PR-AUC | Confusion matrix `[[TN,FP],[FN,TP]]` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Logistic Regression (`class_weight=balanced`) | Single snapshot | 0.9714 | 0.7062 | 0.8179 | 0.6980 | 0.7033 | 0.9823 | `[[7,7],[99,238]]` |
+| Random Forest (`class_weight=balanced`) | Single snapshot | 0.9598 | 0.9911 | 0.9752 | 0.9516 | 0.6872 | 0.9785 | `[[0,14],[3,334]]` |
+| LightGBM (`class_weight=balanced`) | Single snapshot | 0.9642 | 0.9585 | 0.9613 | 0.9259 | 0.6617 | 0.9779 | `[[2,12],[14,323]]` |
+| **XGBoost (selected production model)** | **Three-window, customer-grouped split** | **0.9680** | **0.8406** | **0.8998** | **0.8230** | **0.7398** | **0.9781** | **`[[20,19],[109,575]]`** |
+
+Random Forest and LightGBM achieve higher F1/Accuracy on their single-snapshot test cohort, while production XGBoost is selected for the platform's temporally pooled, customer-isolated training/evaluation workflow. Its ROC-AUC is not the highest score among every displayed baseline because the evaluation protocols and test cohorts differ. The production split explicitly groups by `customer_unique_id`; measured customer overlap between train and test is **0**.
+
+The three snapshots contain **726**, **1,199**, and **1,753** rows respectively, for **3,678 pooled rows**. The final grouped split has **2,955 training rows** and **723 test rows**. Sliding Window XGBoost feature importances (`feature_importances_`) rank as follows:
+
+| Rank | Feature | Importance |
+| ---: | --- | ---: |
+| 1 | `frequency` | 30.88% |
+| 2 | `recency_days` | 22.76% |
+| 3 | `monetary` | 17.09% |
+| 4 | `avg_item_price` | 15.09% |
+| 5 | `avg_review_score` | 14.18% |
+
+These importances describe this fitted model and are not causal effects.
+
+## Report figures
+
+The [`report_figures/`](report_figures/) directory contains 300-DPI PNG figures from the local analysis run:
+
+1. [Customer order frequency](report_figures/fig1_order_frequency.png)
+2. [Monthly order and revenue trend](report_figures/fig2_monthly_trend.png)
+3. [RFM segment distribution](report_figures/fig3_rfm_segments.png)
+4. [Model ROC-AUC and F1 comparison](report_figures/fig4_model_comparison.png)
+5. [Sliding Window XGBoost confusion matrix](report_figures/fig5_confusion_matrix.png)
+6. [XGBoost feature importances](report_figures/fig6_feature_importance.png)
+
+The model comparison figure visualizes ROC-AUC and F1; consult the table above for all metrics and the test protocol.
+
+## Repository contents
 
 ```text
 .
 ├── analytics/                 # K-Means RFM segmentation
-├── database/                  # ML mart DDL
-├── etl/                       # PostgreSQL connection settings helper
-├── experiments/               # Data loaders and model comparison experiments
-├── models/                    # Production sliding-window XGBoost training
-├── report_figures/            # Report-ready PNG outputs
-├── .env.example               # Local PostgreSQL connection template
-├── requirements.txt
-└── README.md
+├── database/                  # ML-facing Gold mart contract
+├── etl/                       # PostgreSQL connection helper
+├── experiments/               # Cohort loaders and comparison training scripts
+├── models/                    # Production sliding-window XGBoost trainer
+├── report_figures/            # Report-ready PNG figures
+├── .env.example               # Safe local DB config template
+└── requirements.txt
 ```
 
-## Requirements and setup
+## Setup
 
-- Python 3.10 or newer
-- PostgreSQL populated with the project's Silver and Gold analytical tables
-- Read access to the tables listed in [Gold data contract](#gold-data-contract)
-- Write access to `gold.mart_customer_segments` only when running the segmentation job
+Requirements: Python 3.10+ and a PostgreSQL database already populated by the upstream LogiStack ETL with the tables in the [Gold/Silver data contract](#goldsilver-data-contract).
 
 ```powershell
 python -m venv .venv
@@ -60,11 +121,11 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Set the `.env` values for your local PostgreSQL. Keep `.env` local; never commit database passwords or customer-level extracts.
+Edit `.env` with your local PostgreSQL connection details. Do not commit `.env` or share credentials. The default example points to the upstream project's local Docker port `5434`; change it to match your setup.
 
-## Run experiments
+## Run the experiments
 
-Run commands from this repository's root directory:
+Run these commands from the repository root after the upstream warehouse is available:
 
 ```powershell
 python experiments/train_logistic_regression.py
@@ -75,27 +136,28 @@ python models/train_churn.py
 python analytics/customer_analysis.py
 ```
 
-The first four commands train and evaluate experiment models. `models/train_churn.py` trains the production sliding-window model and writes `models/churn_model.joblib`; that generated model artifact is ignored by Git. `analytics/customer_analysis.py` recalculates segments and replaces rows in `gold.mart_customer_segments`, so run it only when that write is intended.
+The experiment scripts print metrics and update their benchmark tracking files where configured. `models/train_churn.py` writes `models/churn_model.joblib`, which is ignored by Git. `analytics/customer_analysis.py` truncates and reloads `gold.mart_customer_segments`; run it only when you intend to replace that table's contents.
 
-## Gold data contract
+## Gold/Silver data contract
 
-The model loaders expect the following columns:
+Churn training reads these columns:
 
 | Table | Required columns |
 | --- | --- |
 | `gold.fact_orders` | `order_id`, `customer_unique_id`, `order_purchase_timestamp`, `order_status`, `total_product_amount` |
 | `gold.fact_order_items` | `order_id`, `price` |
 | `silver.order_reviews` | `order_id`, `review_score` |
-| `gold.mart_customer_rfm` | `customer_unique_id`, `recency_days`, `frequency`, `monetary`, `reference_date` |
 
-The temporal loaders derive historical features before each snapshot and label whether an order occurs during the next 180 days. Only customers with at least two historical orders enter the churn cohort. Model code reads customer IDs to enforce group isolation; do not publish row-level data or database extracts.
-
-For base fact table DDL, ETL, and fields used by the prediction API, see the upstream [Logistack data engineering repository](https://github.com/ddemi-ssena/Softito_Logistack_Project). The `gold.mart_customer_rfm` table is produced by that repository's Gold ETL; this repository documents the ML-facing contract and the segments mart.
+RFM segmentation reads `gold.mart_customer_rfm(customer_unique_id, recency_days, frequency, monetary, reference_date)` and writes `gold.mart_customer_segments`; the required mart DDL is documented in [`database/01_ml_data_contract.sql`](database/01_ml_data_contract.sql). Base facts and the RFM source mart are built by the platform's ETL, not by this repository. Use [`database/05_ml_marts.sql`](database/05_ml_marts.sql) for the existing segment-mart definition.
 
 ## Reproducibility and data handling
 
-- Snapshot dates, 180-day horizon, minimum historical order count, random seeds, and model parameters are defined in the Python source.
-- The production sliding-window split groups by customer and checks that train/test customer IDs do not overlap.
-- Preprocessing is fitted on training rows only.
-- No row-level source data, `.env`, or trained `.joblib` artifact belongs in this repository.
-- Metrics can change when the upstream Gold data or software versions change. Record the data snapshot and dependency versions when producing a new official benchmark.
+- Snapshot dates, target horizon, cohort threshold, random seeds, and model parameters are defined in source code.
+- Production validation uses a customer-grouped split and raises an error if customer IDs overlap between train and test.
+- Scaler fitting for the production model uses training rows only.
+- No source CSVs, customer-row extracts, database dump, credentials, or fitted model bundle should be committed here.
+- Results may change with a new warehouse snapshot or dependency versions; record both when publishing an updated benchmark.
+
+## Dataset terms
+
+The Olist dataset remains subject to the terms of its [Kaggle dataset page](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce). Obtain source data from that page and follow its redistribution terms. This repository contains code and aggregate results, not copies of the source dataset.
